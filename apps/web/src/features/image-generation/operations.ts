@@ -1656,18 +1656,21 @@ async function runQueuedImageGenerationForUser({
   });
 
   // 纯中转：不落生成历史。其余 db.update(generation) 在无行时天然 no-op。
-  if (!relayOnly)
-    await db.insert(generation).values({
-      id: generationId,
-      userId: input.userId,
-      prompt: input.prompt,
-      model: recordModel,
-      size,
-      status: "pending",
-      creditsConsumed: initialCreditCharge,
-      storageBucket: bucket,
-      metadata:
-        input.mode === "edit"
+  // 防御性降级写入：INSERT 失败（metadata 超大/并发冲突/字段截断等 DB 层错误）
+  // 时用最小可写版本重试——保证后续错误（上游 400 等）至少能 UPDATE 落库，
+  // 避免「用户看到报错但历史记录里查不到」的口径断裂。
+  const buildGenerationValues = (compact: boolean) => ({
+    id: generationId,
+    userId: input.userId,
+    prompt: compact ? input.prompt.substring(0, 2000) : input.prompt,
+    model: recordModel,
+    size,
+    status: "pending" as const,
+    creditsConsumed: initialCreditCharge,
+    storageBucket: bucket,
+    metadata: compact
+      ? { mode: input.mode, ...backendMetadata, ...billingMetadata }
+      : input.mode === "edit"
           ? {
               mode: "edit",
               ...backendMetadata,
@@ -1732,7 +1735,28 @@ async function runQueuedImageGenerationForUser({
                 moderationBlockingEnabled: moderationEnabled,
                 moderationFailureCredits,
               },
-    });
+  });
+  if (!relayOnly) {
+    try {
+      await db.insert(generation).values(buildGenerationValues(false));
+    } catch (insertError) {
+      // 全量 INSERT 失败 → 降级用 compact 版本重试（截断 prompt、剥离
+      // inputImages 等大字段）。再失败则记日志放行——后续 UPDATE 自然 no-op，
+      // 但扣费/退款链路不受影响，用户至少能收到真实错误而非 DB 异常。
+      logWarn("generation INSERT 失败,降级写入 compact 版本", {
+        generationId,
+        error: insertError instanceof Error ? insertError.message : String(insertError),
+      });
+      try {
+        await db.insert(generation).values(buildGenerationValues(true));
+      } catch (compactError) {
+        logWarn("generation compact INSERT 也失败,跳过记录(扣费不受影响)", {
+          generationId,
+          error: compactError instanceof Error ? compactError.message : String(compactError),
+        });
+      }
+    }
+  }
 
   let chargedCredits = 0;
   const refundChargedCredits = async (
