@@ -141,6 +141,8 @@ export const CONTENT_SAFETY_REJECTION_PATTERNS = [
   "生成系统审核",
   "生成系统的安全检查",
   "内容审查",
+  "内容政策",
+  "防护限制",
   "露骨",
   "性暗示",
   "明显性化",
